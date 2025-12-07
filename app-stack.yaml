@@ -1,0 +1,201 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: IS698 - ALB + Auto Scaling EC2 + RDS + Lambda
+
+Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+  PublicSubnetId:
+    Type: AWS::EC2::Subnet::Id
+  PublicSubnetIdB:
+    Type: AWS::EC2::Subnet::Id
+  PrivateSubnetId:
+    Type: AWS::EC2::Subnet::Id
+  PrivateSubnetIdB:
+    Type: AWS::EC2::Subnet::Id
+  AlbSecurityGroupId:
+    Type: AWS::EC2::SecurityGroup::Id
+  WebSecurityGroupId:
+    Type: AWS::EC2::SecurityGroup::Id
+  DbSecurityGroupId:
+    Type: AWS::EC2::SecurityGroup::Id
+  KeyName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: Existing EC2 KeyPair name
+  InstanceType:
+    Type: String
+    Default: t3.micro
+  AmiId:
+    Type: AWS::EC2::Image::Id
+    Description: Amazon Linux 2023 AMI ID in us-east-1
+  DBName:
+    Type: String
+    Default: is698db
+  DBUser:
+    Type: String
+    Default: dbuser
+  DBPassword:
+    Type: String
+    NoEcho: true
+  DBAllocatedStorage:
+    Type: Number
+    Default: 20
+
+Resources:
+  # ----------------- ALB -----------------
+  AppLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: is698-alb
+      Scheme: internet-facing
+      Subnets:
+        - !Ref PublicSubnetId
+        - !Ref PublicSubnetIdB
+      SecurityGroups:
+        - !Ref AlbSecurityGroupId
+      Type: application
+
+  AppTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: is698-tg
+      VpcId: !Ref VpcId
+      Port: 80
+      Protocol: HTTP
+      TargetType: instance
+      HealthCheckPath: /
+      Matcher:
+        HttpCode: '200'
+
+  AppListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref AppLoadBalancer
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref AppTargetGroup
+
+  # ----------------- Launch Template -----------------
+  WebLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: is698-web-lt
+      LaunchTemplateData:
+        ImageId: !Ref AmiId
+        InstanceType: !Ref InstanceType
+        KeyName: !Ref KeyName
+        SecurityGroupIds:
+          - !Ref WebSecurityGroupId
+        MetadataOptions:
+          HttpTokens: required
+        UserData:
+          Fn::Base64: |
+            #!/bin/bash
+            dnf update -y
+            dnf install -y httpd
+            systemctl enable httpd
+            echo "<h1>Welcome to my IS698 Static Web App</h1>" > /var/www/html/index.html
+            echo "<p>This page is served from an EC2 instance behind an ALB in a public subnet.</p>" >> /var/www/html/index.html
+            systemctl restart httpd
+
+  # ----------------- Auto Scaling Group -----------------
+  WebAutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      VPCZoneIdentifier:
+        - !Ref PublicSubnetId
+        - !Ref PublicSubnetIdB
+      MinSize: '1'
+      MaxSize: '2'
+      DesiredCapacity: '1'
+      LaunchTemplate:
+        LaunchTemplateId: !Ref WebLaunchTemplate
+        Version: !GetAtt WebLaunchTemplate.LatestVersionNumber
+      TargetGroupARNs:
+        - !Ref AppTargetGroup
+    UpdatePolicy:
+      AutoScalingRollingUpdate:
+        MinInstancesInService: '1'
+        MaxBatchSize: '1'
+
+  # ----------------- RDS Subnet Group + DB Instance -----------------
+  DbSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Private subnets for IS698 DB
+      SubnetIds:
+        - !Ref PrivateSubnetId
+        - !Ref PrivateSubnetIdB
+
+  AppDB:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      DBInstanceClass: db.t3.micro
+      AllocatedStorage: !Ref DBAllocatedStorage
+      Engine: postgres
+      DBName: !Ref DBName
+      MasterUsername: !Ref DBUser
+      MasterUserPassword: !Ref DBPassword
+      PubliclyAccessible: false
+      VPCSecurityGroups:
+        - !Ref DbSecurityGroupId
+      DBSubnetGroupName: !Ref DbSubnetGroup
+      DeletionProtection: false
+      BackupRetentionPeriod: 0
+
+  # ----------------- IAM Role for Lambda -----------------
+  LambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+
+  # ----------------- Lambda Function -----------------
+  S3UploadLogger:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: is698-s3-upload-logger
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaRole.Arn
+      Timeout: 30
+      Code:
+        ZipFile: |
+          import json, logging
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          def lambda_handler(event, context):
+              logger.info("EVENT: %s", json.dumps(event))
+              records = event.get('Records', [])
+              messages = []
+              for r in records:
+                  s3 = r.get('s3', {})
+                  bucket = s3.get('bucket', {}).get('name')
+                  key = s3.get('object', {}).get('key')
+                  messages.append(f"New upload: s3://{bucket}/{key}")
+              return {
+                  "statusCode": 200,
+                  "body": json.dumps({"messages": messages})
+              }
+
+Outputs:
+  AlbDNSName:
+    Description: DNS name of the Application Load Balancer
+    Value: !GetAtt AppLoadBalancer.DNSName
+
+  DBEndpoint:
+    Description: Endpoint of the RDS instance
+    Value: !GetAtt AppDB.Endpoint.Address
+
+  LambdaFunctionName:
+    Description: Name of the Lambda function
+    Value: !Ref S3UploadLogger
